@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -106,6 +107,11 @@ type File struct {
 
 	r       map[mtypes.UUID]io.ReaderAt
 	closers map[mtypes.UUID]io.Closer
+
+	// strtabs holds each LC_SYMTAB string pool read from a cache file that
+	// isn't mmap'd, so every dylib pointing at the pool shares one copy
+	strtabMu sync.Mutex
+	strtabs  map[strtabKey][]byte
 
 	// sortedImages is Images sorted by LoadAddress for O(log N) binary search
 	sortedImages []*CacheImage
@@ -255,6 +261,9 @@ func (f *File) Close() error {
 	if f.AddressToSymbol != nil {
 		f.AddressToSymbol.Close()
 	}
+	f.strtabMu.Lock()
+	f.strtabs = nil
+	f.strtabMu.Unlock()
 	var err error
 	for uuid, closer := range f.closers {
 		if closer != nil {
@@ -1995,4 +2004,90 @@ func (f *File) HasImagePath(path string) (int, error) {
 	}
 
 	return int(imageIndex), nil
+}
+
+type strtabKey struct {
+	uuid mtypes.UUID
+	off  int64
+	size uint64
+}
+
+// stringTableLookup implements go-macho's FileConfig.StringTableLookup for
+// image i: it returns a function that yields the NUL-terminated name at an
+// offset into the shared LC_SYMTAB string pool. The pool's bytes never leave
+// this package; go-macho only ever receives copied strings.
+func (f *File) stringTableLookup(i *CacheImage, off int64, size uint64) (func(uint64) string, error) {
+	tab, err := f.sharedStringTable(i, off, size)
+	if err != nil {
+		return nil, err
+	}
+	return func(o uint64) string {
+		// go-macho checks o < size before calling; guard anyway so a bad
+		// offset yields an empty name rather than a panic.
+		if o >= uint64(len(tab)) {
+			return ""
+		}
+		b := tab[o:]
+		if n := bytes.IndexByte(b, 0); n >= 0 {
+			b = b[:n]
+		}
+		return string(b)
+	}, nil
+}
+
+// sharedStringTable returns the LC_SYMTAB string table for image i. Every dylib
+// in a cache points its symtab at the same shared pool, so rather than copying
+// it per image, the pool is sliced out of the mmap'd subcache or, where the
+// cache isn't mmap'd, read from disk once per File.
+func (f *File) sharedStringTable(i *CacheImage, off int64, size uint64) ([]byte, error) {
+	pm, err := i.GetPartialMacho()
+	if err != nil {
+		return nil, err
+	}
+	le := pm.Segment("__LINKEDIT")
+	if le == nil {
+		return nil, fmt.Errorf("failed to get __LINKEDIT segment")
+	}
+	uuid, _, err := f.GetOffset(le.Addr)
+	if err != nil {
+		return nil, err
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+
+	// mmap'd subcache: hand back the mapping itself (same base translation as
+	// CacheImage.ReadAt). Nothing is copied onto the heap and nothing needs
+	// releasing; the slice stays inside this package (see stringTableLookup).
+	if data, ok := mappedBytes(f.r[uuid]); ok {
+		start := i.base + off
+		end := start + int64(size)
+		if start < 0 || end > int64(len(data)) {
+			return nil, fmt.Errorf("string table %#x-%#x extends past the end of the cache file", off, off+int64(size))
+		}
+		return data[start:end:end], nil
+	}
+
+	key := strtabKey{uuid: uuid, off: off, size: size}
+	f.strtabMu.Lock()
+	defer f.strtabMu.Unlock()
+	if buf, ok := f.strtabs[key]; ok {
+		return buf, nil
+	}
+	// Probe the pool's last byte before allocating, so a corrupt LC_SYMTAB can't
+	// make us allocate up to 4 GiB for a range the file doesn't contain (the
+	// guard saferio.ReadDataAt gives the unshared path).
+	var last [1]byte
+	if n, _ := i.ReadAt(last[:], off+int64(size)-1); n != 1 {
+		return nil, fmt.Errorf("string table %#x-%#x extends past the end of the cache file", off, off+int64(size))
+	}
+	buf := make([]byte, size)
+	if n, err := i.ReadAt(buf, off); err != nil && !(errors.Is(err, io.EOF) && uint64(n) == size) {
+		return nil, fmt.Errorf("failed to read string table at %#x: %w", off, err)
+	}
+	if f.strtabs == nil {
+		f.strtabs = make(map[strtabKey][]byte)
+	}
+	f.strtabs[key] = buf
+	return buf, nil
 }

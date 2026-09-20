@@ -519,6 +519,9 @@ func (i *CacheImage) GetMacho() (*macho.File, error) {
 		CacheReader:          i,
 		VMAddrConverter:      vma,
 		RelativeSelectorBase: rsBase,
+		StringTableLookup: func(off int64, size uint64) (func(uint64) string, error) {
+			return i.cache.stringTableLookup(i, off, size)
+		},
 	})
 	if err != nil {
 		return nil, err
