@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !unix && !(windows && (amd64 || arm64))
 
 package dyld
 
