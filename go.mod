@@ -267,3 +267,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.55.0 // indirect
 )
+
+replace github.com/blacktop/go-macho => github.com/echthesia/go-macho v1.1.284-0.20260922101841-aa448193d4e3
